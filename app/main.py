@@ -44,7 +44,43 @@ ALLOWED_SORT_FIELDS = {"id", "name", "price_cents", "stock"}
 # ---------- Standard error format ----------
 def error_body(code: str, message: str, details: list | None = None) -> dict:
     return {"error": {"code": code, "message": message, "details": details or []}}
+class AppError(Exception):
+    def __init__(self, status_code: int, code: str, message: str):
+        self.status_code = status_code
+        self.code = code
+        self.message = message
 
+
+@app.exception_handler(AppError)
+async def app_error_handler(request: Request, exc: AppError):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content=error_body(exc.code, exc.message),
+    )
+
+
+RATE_LIMIT = 20   # requests allowed
+WINDOW = 10       # per this many seconds
+hits: dict[str, deque] = defaultdict(deque)
+
+
+@app.middleware("http")
+async def rate_limit(request: Request, call_next):
+    if request.url.path.startswith("/v1"):
+        ip = request.client.host if request.client else "unknown"
+        now = time.monotonic()
+        recent = hits[ip]
+        while recent and now - recent[0] > WINDOW:
+            recent.popleft()
+        if len(recent) >= RATE_LIMIT:
+            retry_after = int(WINDOW - (now - recent[0])) + 1
+            return JSONResponse(
+                status_code=429,
+                content=error_body("RATE_LIMITED", "Too many requests"),
+                headers={"Retry-After": str(retry_after)},
+            )
+        recent.append(now)
+    return await call_next(request)
 
 @app.exception_handler(StarletteHTTPException)
 async def http_error_handler(request: Request, exc: StarletteHTTPException):

@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Response
+from fastapi import FastAPI, HTTPException, Query, Response
 from pydantic import BaseModel, Field
 
 app = FastAPI()
@@ -23,9 +23,41 @@ def health():
     return {"status": "ok"}
 
 
+ALLOWED_SORT_FIELDS = {"id", "name", "price_cents", "stock"}
+
+
 @app.get("/products")
-def list_products():
-    return list(products.values())
+def list_products(
+    q: str | None = None,
+    min_price: int | None = Query(default=None, ge=0),
+    max_price: int | None = Query(default=None, ge=0),
+    sort: str = "id",
+    page: int = Query(default=1, ge=1),
+    limit: int = Query(default=10, ge=1, le=100),
+):
+    items = list(products.values())
+
+    if q:
+        items = [p for p in items if q.lower() in p.name.lower()]
+    if min_price is not None:
+        items = [p for p in items if p.price_cents >= min_price]
+    if max_price is not None:
+        items = [p for p in items if p.price_cents <= max_price]
+
+    descending = sort.startswith("-")
+    field = sort.removeprefix("-")
+    if field not in ALLOWED_SORT_FIELDS:
+        raise HTTPException(status_code=400, detail="Invalid sort field")
+    items.sort(key=lambda p: getattr(p, field), reverse=descending)
+
+    total = len(items)
+    start = (page - 1) * limit
+    return {
+        "items": items[start : start + limit],
+        "total": total,
+        "page": page,
+        "limit": limit,
+    }
 
 
 @app.get("/products/{product_id}")

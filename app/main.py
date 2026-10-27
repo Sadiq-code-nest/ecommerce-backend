@@ -1,6 +1,7 @@
 import time
 from collections import defaultdict, deque
-from fastapi import APIRouter, FastAPI, Header, HTTPException, Query, Request, Response
+
+from fastapi import APIRouter, FastAPI, Header, Query, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
@@ -44,6 +45,8 @@ ALLOWED_SORT_FIELDS = {"id", "name", "price_cents", "stock"}
 # ---------- Standard error format ----------
 def error_body(code: str, message: str, details: list | None = None) -> dict:
     return {"error": {"code": code, "message": message, "details": details or []}}
+
+
 class AppError(Exception):
     def __init__(self, status_code: int, code: str, message: str):
         self.status_code = status_code
@@ -59,6 +62,28 @@ async def app_error_handler(request: Request, exc: AppError):
     )
 
 
+@app.exception_handler(StarletteHTTPException)
+async def http_error_handler(request: Request, exc: StarletteHTTPException):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content=error_body(f"HTTP_{exc.status_code}", str(exc.detail)),
+        headers=exc.headers,
+    )
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_error_handler(request: Request, exc: RequestValidationError):
+    details = [
+        {"field": ".".join(str(part) for part in e["loc"]), "message": e["msg"]}
+        for e in exc.errors()
+    ]
+    return JSONResponse(
+        status_code=422,
+        content=error_body("VALIDATION_ERROR", "Invalid request", details),
+    )
+
+
+# ---------- Rate limiting ----------
 RATE_LIMIT = 20   # requests allowed
 WINDOW = 10       # per this many seconds
 hits: dict[str, deque] = defaultdict(deque)
@@ -81,26 +106,6 @@ async def rate_limit(request: Request, call_next):
             )
         recent.append(now)
     return await call_next(request)
-
-@app.exception_handler(StarletteHTTPException)
-async def http_error_handler(request: Request, exc: StarletteHTTPException):
-    return JSONResponse(
-        status_code=exc.status_code,
-        content=error_body(f"HTTP_{exc.status_code}", str(exc.detail)),
-        headers=exc.headers,
-    )
-
-
-@app.exception_handler(RequestValidationError)
-async def validation_error_handler(request: Request, exc: RequestValidationError):
-    details = [
-        {"field": ".".join(str(part) for part in e["loc"]), "message": e["msg"]}
-        for e in exc.errors()
-    ]
-    return JSONResponse(
-        status_code=422,
-        content=error_body("VALIDATION_ERROR", "Invalid request", details),
-    )
 
 
 # ---------- Routes ----------
@@ -130,7 +135,7 @@ def list_products(
     descending = sort.startswith("-")
     field = sort.removeprefix("-")
     if field not in ALLOWED_SORT_FIELDS:
-        raise HTTPException(status_code=400, detail="Invalid sort field")
+        raise AppError(400, "INVALID_SORT_FIELD", "Invalid sort field")
     items.sort(key=lambda p: getattr(p, field), reverse=descending)
 
     start = (page - 1) * limit
@@ -145,7 +150,7 @@ def list_products(
 @router.get("/products/{product_id}", response_model=Product)
 def get_product(product_id: int):
     if product_id not in products:
-        raise HTTPException(status_code=404, detail="Product not found")
+        raise AppError(404, "PRODUCT_NOT_FOUND", "Product not found")
     return products[product_id]
 
 
@@ -162,15 +167,16 @@ def create_product(
         if idempotency_key in idempotency_store:
             saved_payload, saved_product = idempotency_store[idempotency_key]
             if saved_payload != payload:
-                raise HTTPException(
-                    status_code=422,
-                    detail="Idempotency-Key was already used with a different body",
+                raise AppError(
+                    422,
+                    "IDEMPOTENCY_KEY_REUSED",
+                    "Idempotency-Key was already used with a different body",
                 )
             response.status_code = 200
             return saved_product
 
     if any(p.name.lower() == data.name.lower() for p in products.values()):
-        raise HTTPException(status_code=409, detail="Product name already exists")
+        raise AppError(409, "PRODUCT_NAME_EXISTS", "Product name already exists")
 
     product = Product(id=next_id, **payload)
     products[next_id] = product
@@ -183,7 +189,7 @@ def create_product(
 @router.put("/products/{product_id}", response_model=Product)
 def replace_product(product_id: int, data: ProductIn):
     if product_id not in products:
-        raise HTTPException(status_code=404, detail="Product not found")
+        raise AppError(404, "PRODUCT_NOT_FOUND", "Product not found")
     products[product_id] = Product(id=product_id, **data.model_dump())
     return products[product_id]
 
@@ -191,7 +197,7 @@ def replace_product(product_id: int, data: ProductIn):
 @router.patch("/products/{product_id}", response_model=Product)
 def update_product(product_id: int, data: ProductPatch):
     if product_id not in products:
-        raise HTTPException(status_code=404, detail="Product not found")
+        raise AppError(404, "PRODUCT_NOT_FOUND", "Product not found")
     changes = data.model_dump(exclude_unset=True)
     updated = products[product_id].model_copy(update=changes)
     products[product_id] = updated
@@ -201,7 +207,7 @@ def update_product(product_id: int, data: ProductPatch):
 @router.delete("/products/{product_id}", status_code=204)
 def delete_product(product_id: int):
     if product_id not in products:
-        raise HTTPException(status_code=404, detail="Product not found")
+        raise AppError(404, "PRODUCT_NOT_FOUND", "Product not found")
     del products[product_id]
     return Response(status_code=204)
 

@@ -13,7 +13,18 @@ class ProductIn(BaseModel):
 class Product(ProductIn):
     id: int
 
-
+class ProductPatch(BaseModel):
+    name: str | None = Field(default=None, min_length=1)
+    price_cents: int | None = Field(default=None, ge=0)
+    stock: int | None = Field(default=None, ge=0)
+@app.patch("/products/{product_id}")
+def update_product(product_id: int, data: ProductPatch):
+    if product_id not in products:
+        raise HTTPException(status_code=404, detail="Product not found")
+    changes = data.model_dump(exclude_unset=True)
+    updated = products[product_id].model_copy(update=changes)
+    products[product_id] = updated
+    return updated
 products: dict[int, Product] = {}
 next_id = 1
 

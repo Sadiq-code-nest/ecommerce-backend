@@ -44,5 +44,5 @@ class Product(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
-
 Index("uq_products_name_lower", func.lower(Product.name), unique=True, postgresql_where=text("is_active"))
+Index("ix_products_name_trgm", Product.name, postgresql_using="gin", postgresql_ops={"name": "gin_trgm_ops"})

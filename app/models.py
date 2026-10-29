@@ -5,7 +5,7 @@ from sqlalchemy import (
     Identity, Index, Integer, Text, func,
 )
 from sqlalchemy.orm import Mapped, mapped_column
-
+from sqlalchemy import text
 from app.db import Base
 
 
@@ -45,5 +45,4 @@ class Product(Base):
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
 
-
-Index("uq_products_name_lower", func.lower(Product.name), unique=True)
+Index("uq_products_name_lower", func.lower(Product.name), unique=True, postgresql_where=text("is_active"))

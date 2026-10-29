@@ -1,17 +1,23 @@
 import time
 from collections import defaultdict, deque
 
-from fastapi import APIRouter, FastAPI, Header, Query, Request, Response
+from fastapi import APIRouter, Depends, FastAPI, Header, Query, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
+from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
 from starlette.exceptions import HTTPException as StarletteHTTPException
+
+from app.db import get_db
+from app.models import Product as ProductRow
 
 app = FastAPI()
 router = APIRouter(prefix="/v1", tags=["products"])
 
 
-# ---------- Schemas ----------
+# ---------- Schemas (what the API accepts and returns) ----------
 class ProductIn(BaseModel):
     name: str = Field(min_length=1)
     price_cents: int = Field(ge=0)
@@ -19,6 +25,7 @@ class ProductIn(BaseModel):
 
 
 class Product(ProductIn):
+    model_config = ConfigDict(from_attributes=True)  # allow reading database rows
     id: int
 
 
@@ -35,9 +42,7 @@ class ProductPage(BaseModel):
     limit: int
 
 
-# ---------- In-memory data ----------
-products: dict[int, Product] = {}
-next_id = 1
+# ---------- Still in memory (Redis replaces this later) ----------
 idempotency_store: dict[str, tuple[dict, Product]] = {}
 ALLOWED_SORT_FIELDS = {"id", "name", "price_cents", "stock"}
 
@@ -56,10 +61,7 @@ class AppError(Exception):
 
 @app.exception_handler(AppError)
 async def app_error_handler(request: Request, exc: AppError):
-    return JSONResponse(
-        status_code=exc.status_code,
-        content=error_body(exc.code, exc.message),
-    )
+    return JSONResponse(status_code=exc.status_code, content=error_body(exc.code, exc.message))
 
 
 @app.exception_handler(StarletteHTTPException)
@@ -84,8 +86,8 @@ async def validation_error_handler(request: Request, exc: RequestValidationError
 
 
 # ---------- Rate limiting ----------
-RATE_LIMIT = 20   # requests allowed
-WINDOW = 10       # per this many seconds
+RATE_LIMIT = 20
+WINDOW = 10
 hits: dict[str, deque] = defaultdict(deque)
 
 
@@ -108,6 +110,22 @@ async def rate_limit(request: Request, call_next):
     return await call_next(request)
 
 
+# ---------- Helpers ----------
+def get_active_or_404(db: Session, product_id: int) -> ProductRow:
+    row = db.get(ProductRow, product_id)
+    if row is None or not row.is_active:
+        raise AppError(404, "PRODUCT_NOT_FOUND", "Product not found")
+    return row
+
+
+def commit_or_409(db: Session) -> None:
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise AppError(409, "PRODUCT_NAME_EXISTS", "Product name already exists")
+
+
 # ---------- Routes ----------
 @app.get("/health")
 def health():
@@ -122,36 +140,35 @@ def list_products(
     sort: str = "id",
     page: int = Query(default=1, ge=1),
     limit: int = Query(default=10, ge=1, le=100),
+    db: Session = Depends(get_db),
 ):
-    items = list(products.values())
-
-    if q:
-        items = [p for p in items if q.lower() in p.name.lower()]
-    if min_price is not None:
-        items = [p for p in items if p.price_cents >= min_price]
-    if max_price is not None:
-        items = [p for p in items if p.price_cents <= max_price]
-
     descending = sort.startswith("-")
     field = sort.removeprefix("-")
     if field not in ALLOWED_SORT_FIELDS:
         raise AppError(400, "INVALID_SORT_FIELD", "Invalid sort field")
-    items.sort(key=lambda p: getattr(p, field), reverse=descending)
 
-    start = (page - 1) * limit
-    return {
-        "items": items[start : start + limit],
-        "total": len(items),
-        "page": page,
-        "limit": limit,
-    }
+    stmt = select(ProductRow).where(ProductRow.is_active.is_(True))
+    if q:
+        stmt = stmt.where(ProductRow.name.ilike(f"%{q}%"))
+    if min_price is not None:
+        stmt = stmt.where(ProductRow.price_cents >= min_price)
+    if max_price is not None:
+        stmt = stmt.where(ProductRow.price_cents <= max_price)
+
+    total = db.scalar(select(func.count()).select_from(stmt.subquery()))
+
+    column = getattr(ProductRow, field)
+    order = column.desc() if descending else column.asc()
+    items = db.scalars(
+        stmt.order_by(order, ProductRow.id).offset((page - 1) * limit).limit(limit)
+    ).all()
+
+    return {"items": items, "total": total, "page": page, "limit": limit}
 
 
 @router.get("/products/{product_id}", response_model=Product)
-def get_product(product_id: int):
-    if product_id not in products:
-        raise AppError(404, "PRODUCT_NOT_FOUND", "Product not found")
-    return products[product_id]
+def get_product(product_id: int, db: Session = Depends(get_db)):
+    return get_active_or_404(db, product_id)
 
 
 @router.post("/products", status_code=201, response_model=Product)
@@ -159,57 +176,62 @@ def create_product(
     data: ProductIn,
     response: Response,
     idempotency_key: str | None = Header(default=None),
+    db: Session = Depends(get_db),
 ):
-    global next_id
-
     payload = data.model_dump()
-    if idempotency_key:
-        if idempotency_key in idempotency_store:
-            saved_payload, saved_product = idempotency_store[idempotency_key]
-            if saved_payload != payload:
-                raise AppError(
-                    422,
-                    "IDEMPOTENCY_KEY_REUSED",
-                    "Idempotency-Key was already used with a different body",
-                )
-            response.status_code = 200
-            return saved_product
+    if idempotency_key and idempotency_key in idempotency_store:
+        saved_payload, saved_product = idempotency_store[idempotency_key]
+        if saved_payload != payload:
+            raise AppError(
+                422,
+                "IDEMPOTENCY_KEY_REUSED",
+                "Idempotency-Key was already used with a different body",
+            )
+        response.status_code = 200
+        return saved_product
 
-    if any(p.name.lower() == data.name.lower() for p in products.values()):
-        raise AppError(409, "PRODUCT_NAME_EXISTS", "Product name already exists")
+    row = ProductRow(**payload)
+    db.add(row)
+    commit_or_409(db)
+    db.refresh(row)
 
-    product = Product(id=next_id, **payload)
-    products[next_id] = product
-    next_id += 1
+    product = Product.model_validate(row)
     if idempotency_key:
         idempotency_store[idempotency_key] = (payload, product)
     return product
 
 
 @router.put("/products/{product_id}", response_model=Product)
-def replace_product(product_id: int, data: ProductIn):
-    if product_id not in products:
-        raise AppError(404, "PRODUCT_NOT_FOUND", "Product not found")
-    products[product_id] = Product(id=product_id, **data.model_dump())
-    return products[product_id]
+def replace_product(product_id: int, data: ProductIn, db: Session = Depends(get_db)):
+    row = get_active_or_404(db, product_id)
+    for key, value in data.model_dump().items():
+        setattr(row, key, value)
+    row.updated_at = func.now()
+    commit_or_409(db)
+    db.refresh(row)
+    return row
 
 
 @router.patch("/products/{product_id}", response_model=Product)
-def update_product(product_id: int, data: ProductPatch):
-    if product_id not in products:
-        raise AppError(404, "PRODUCT_NOT_FOUND", "Product not found")
+def update_product(product_id: int, data: ProductPatch, db: Session = Depends(get_db)):
+    row = get_active_or_404(db, product_id)
     changes = data.model_dump(exclude_unset=True)
-    updated = products[product_id].model_copy(update=changes)
-    products[product_id] = updated
-    return updated
+    if any(value is None for value in changes.values()):
+        raise AppError(422, "VALIDATION_ERROR", "Fields cannot be set to null")
+    for key, value in changes.items():
+        setattr(row, key, value)
+    row.updated_at = func.now()
+    commit_or_409(db)
+    db.refresh(row)
+    return row
 
 
 @router.delete("/products/{product_id}", status_code=204)
-def delete_product(product_id: int):
-    if product_id not in products:
-        raise AppError(404, "PRODUCT_NOT_FOUND", "Product not found")
-    del products[product_id]
+def delete_product(product_id: int, db: Session = Depends(get_db)):
+    row = get_active_or_404(db, product_id)
+    row.is_active = False  # soft delete: the row stays, so old orders can still point to it
+    db.commit()
     return Response(status_code=204)
 
 
-app.include_router(router)  # must stay LAST: it copies the routes that exist at this moment
+app.include_router(router)  # must stay LAST
